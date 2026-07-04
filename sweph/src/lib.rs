@@ -18,14 +18,21 @@
 //! println!("Ascendant {:.2}°", houses.ascendant);
 //! ```
 //!
-//! # Thread safety
+//! # Thread safety and global configuration
 //!
 //! The Swiss Ephemeris C library keeps global state (the ephemeris path, open
 //! file handles, nutation caches). This crate compiles it with thread-local
 //! storage disabled and serializes every FFI call behind a process-wide mutex,
 //! so the API here is safe to call from any thread. The trade-off is that
 //! calls are serialized — the ephemeris is CPU-cheap, so this is rarely a
-//! bottleneck, but heavy parallel workloads should batch per thread.
+//! bottleneck.
+//!
+//! The configuration functions ([`set_ephe_path`], [`set_sidereal_mode`],
+//! [`set_topocentric`]) mutate **process-wide** state that later computations
+//! read. Each individual call is thread-safe, but a configure-then-compute
+//! sequence is not atomic: if another thread reconfigures between your two
+//! calls, your computation uses its settings. Configure once at startup, or
+//! externally synchronize threads that need different settings.
 //!
 //! # Ephemeris data files
 //!
@@ -34,8 +41,10 @@
 //! environment variable the C library honors). When no files are present the
 //! library silently falls back to the Moshier analytical ephemeris, which
 //! needs no files and is accurate to ~0.1″ for the planets (Chiron and the
-//! asteroids do require data files). Data files are distributed by
-//! Astrodienst at <https://github.com/aloistr/swisseph/tree/master/ephe>.
+//! asteroids do require data files). The [`Position::ephemeris`] field
+//! reports which source was actually used, so the fallback is detectable.
+//! Data files are distributed by Astrodienst at
+//! <https://github.com/aloistr/swisseph/tree/master/ephe>.
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -68,6 +77,20 @@ fn read_serr(buf: &[c_char]) -> String {
     unsafe { CStr::from_ptr(buf.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// Run one C call that reports errors through a `serr` buffer: allocate the
+/// buffer, hold the process-wide lock for the duration of `f`, and convert a
+/// negative return code into `Err` carrying the C error message.
+fn locked_serr_call(f: impl FnOnce(*mut c_char) -> i32) -> Result<i32> {
+    let mut serr = [0 as c_char; sys::SE_MAX_STNAME];
+    let _guard = ffi_lock();
+    let ret = f(serr.as_mut_ptr());
+    drop(_guard);
+    if ret < 0 {
+        return Err(Error::new(read_serr(&serr)));
+    }
+    Ok(ret)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +164,8 @@ pub fn version() -> String {
 
 /// Set the observer position for topocentric calculations
 /// ([`Flags::TOPOCENTRIC`]). `altitude` is meters above sea level.
+///
+/// Process-wide state — see the crate docs on global configuration.
 pub fn set_topocentric(longitude: f64, latitude: f64, altitude: f64) {
     let _guard = ffi_lock();
     unsafe { sys::swe_set_topo(longitude, latitude, altitude) };
@@ -152,9 +177,14 @@ pub fn set_topocentric(longitude: f64, latitude: f64, altitude: f64) {
 
 /// Julian day number (UT) for a Gregorian calendar date.
 /// `hour` is a decimal hour, e.g. `18.5` for 18:30 UT.
-pub fn julian_day(year: i32, month: u32, day: u32, hour: f64) -> f64 {
+///
+/// Values are not validated: out-of-range `month`/`day` are extended
+/// arithmetically by the underlying algorithm (e.g. day 0 is the last day of
+/// the previous month), matching the C library. Use [`utc_to_julian_day`]
+/// for a validating conversion.
+pub fn julian_day(year: i32, month: i32, day: i32, hour: f64) -> f64 {
     let _guard = ffi_lock();
-    unsafe { sys::swe_julday(year, month as i32, day as i32, hour, sys::SE_GREG_CAL) }
+    unsafe { sys::swe_julday(year, month, day, hour, sys::SE_GREG_CAL) }
 }
 
 /// A Gregorian calendar date with decimal hour (UT), as returned by
@@ -191,7 +221,7 @@ pub struct JulianDay {
 }
 
 /// Convert a UTC civil timestamp to Julian day, correctly handling leap
-/// seconds and delta-T.
+/// seconds and delta-T. Unlike [`julian_day`], the date is validated.
 pub fn utc_to_julian_day(
     year: i32,
     month: u32,
@@ -201,9 +231,7 @@ pub fn utc_to_julian_day(
     second: f64,
 ) -> Result<JulianDay> {
     let mut dret = [0.0f64; 2];
-    let mut serr = [0 as c_char; sys::SE_MAX_STNAME];
-    let _guard = ffi_lock();
-    let ret = unsafe {
+    locked_serr_call(|serr| unsafe {
         sys::swe_utc_to_jd(
             year,
             month as i32,
@@ -213,13 +241,9 @@ pub fn utc_to_julian_day(
             second,
             sys::SE_GREG_CAL,
             dret.as_mut_ptr(),
-            serr.as_mut_ptr(),
+            serr,
         )
-    };
-    drop(_guard);
-    if ret < 0 {
-        return Err(Error::new(read_serr(&serr)));
-    }
+    })?;
     Ok(JulianDay {
         et: dret[0],
         ut: dret[1],
@@ -238,30 +262,42 @@ pub fn delta_t(jd_ut: f64) -> f64 {
 
 /// Computation flags for [`calc_with`] / [`houses_with`].
 ///
-/// Combine with `|`: `Flags::SWISS | Flags::SPEED | Flags::SIDEREAL`.
-/// [`Flags::default`] is `SWISS | SPEED`.
+/// Combine with `|`: `Flags::SWISS | Flags::SIDEREAL`.
+/// [`Flags::default`] is [`Flags::SWISS`].
+///
+/// [`Flags::SWISS`] and [`Flags::MOSHIER`] are mutually exclusive ephemeris
+/// *sources* — combining them is rejected with an error rather than letting
+/// the C library silently prefer Moshier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flags(i32);
 
 impl Flags {
-    /// Use the Swiss Ephemeris data files (falls back to Moshier if absent).
+    /// No flags. With no ephemeris-source bit set, the C library defaults to
+    /// the Swiss Ephemeris.
+    pub const NONE: Flags = Flags(0);
+    /// Use the Swiss Ephemeris data files (falls back to Moshier if absent —
+    /// see [`Position::ephemeris`] to detect the substitution).
     pub const SWISS: Flags = Flags(sys::SEFLG_SWIEPH);
     /// Use the built-in Moshier analytical ephemeris (no data files).
     pub const MOSHIER: Flags = Flags(sys::SEFLG_MOSEPH);
-    /// Also compute speeds (`speed_*` fields of [`Position`]).
+    /// Speeds are always requested by [`calc`] / [`calc_with`]; this constant
+    /// is retained for interop with `sweph-sys`.
     pub const SPEED: Flags = Flags(sys::SEFLG_SPEED);
     /// Heliocentric positions.
     pub const HELIOCENTRIC: Flags = Flags(sys::SEFLG_HELCTR);
     /// Barycentric positions.
     pub const BARYCENTRIC: Flags = Flags(sys::SEFLG_BARYCTR);
     /// Equatorial coordinates (right ascension / declination) instead of
-    /// ecliptic longitude / latitude.
+    /// ecliptic longitude / latitude. Honored by [`calc_with`] only — the
+    /// houses path ignores it (see [`houses_with`]).
     pub const EQUATORIAL: Flags = Flags(sys::SEFLG_EQUATORIAL);
-    /// Sidereal zodiac; configure the ayanamsha with [`set_sidereal_mode`].
+    /// Sidereal zodiac. **Call [`set_sidereal_mode`] first** — without it the
+    /// C library silently defaults to the Fagan/Bradley ayanamsha.
     pub const SIDEREAL: Flags = Flags(sys::SEFLG_SIDEREAL);
     /// Topocentric positions; set the observer with [`set_topocentric`].
     pub const TOPOCENTRIC: Flags = Flags(sys::SEFLG_TOPOCTR);
     /// Reference the J2000 equinox instead of the equinox of date.
+    /// Honored by [`calc_with`] only — the houses path ignores it.
     pub const J2000: Flags = Flags(sys::SEFLG_J2000);
     /// No nutation.
     pub const NO_NUTATION: Flags = Flags(sys::SEFLG_NONUT);
@@ -278,11 +314,23 @@ impl Flags {
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
     }
+
+    /// Reject the contradictory SWISS|MOSHIER combination, which the C
+    /// library would otherwise resolve by silently preferring Moshier.
+    fn validate_source(self) -> Result<()> {
+        if self.contains(Flags::SWISS) && self.contains(Flags::MOSHIER) {
+            return Err(Error::new(
+                "Flags::SWISS and Flags::MOSHIER are mutually exclusive; \
+                 pick one ephemeris source",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Flags {
     fn default() -> Self {
-        Flags::SWISS | Flags::SPEED
+        Flags::SWISS
     }
 }
 
@@ -296,6 +344,34 @@ impl std::ops::BitOr for Flags {
 impl std::ops::BitOrAssign for Flags {
     fn bitor_assign(&mut self, rhs: Flags) {
         self.0 |= rhs.0;
+    }
+}
+
+/// The ephemeris source actually used for a computation — see
+/// [`Position::ephemeris`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ephemeris {
+    /// Swiss Ephemeris data files.
+    Swiss,
+    /// Built-in Moshier analytical ephemeris (used when requested, or as the
+    /// silent fallback when data files are missing).
+    Moshier,
+    /// JPL ephemeris file (not currently requestable through this crate's
+    /// [`Flags`]; present for completeness).
+    Jpl,
+}
+
+impl Ephemeris {
+    /// Decode the source bits from the iflag value `swe_calc_ut` returns,
+    /// which reflects the ephemeris it actually used.
+    fn from_iflag(iflag: i32) -> Ephemeris {
+        if iflag & sys::SEFLG_MOSEPH != 0 {
+            Ephemeris::Moshier
+        } else if iflag & sys::SEFLG_JPLEPH != 0 {
+            Ephemeris::Jpl
+        } else {
+            Ephemeris::Swiss
+        }
     }
 }
 
@@ -336,7 +412,7 @@ pub enum Body {
 }
 
 impl Body {
-    /// The ten classical planets plus the true node — a common natal set.
+    /// The ten classical planets — a common natal set.
     pub const PLANETS: &'static [Body] = &[
         Body::Sun,
         Body::Moon,
@@ -444,6 +520,10 @@ impl Sign {
 
     /// The sign containing an ecliptic longitude in degrees.
     pub fn from_longitude(longitude: f64) -> Sign {
+        // The trailing `% 12` looks redundant but is load-bearing: for tiny
+        // negative inputs, `rem_euclid(360.0)` can round to exactly 360.0,
+        // making the index 12 — without the modulo that is an out-of-bounds
+        // panic. Do not "simplify" this expression.
         Sign::ALL[(longitude.rem_euclid(360.0) / 30.0) as usize % 12]
     }
 
@@ -486,10 +566,14 @@ pub struct Position {
     pub longitude: f64,
     pub latitude: f64,
     pub distance: f64,
-    /// Degrees per day; `0.0` unless [`Flags::SPEED`] was set.
+    /// Degrees per day (speeds are always computed).
     pub speed_longitude: f64,
     pub speed_latitude: f64,
     pub speed_distance: f64,
+    /// The ephemeris source actually used. When [`Flags::SWISS`] was
+    /// requested but the data files are missing, the C library silently
+    /// substitutes Moshier — this field reports the substitution.
+    pub ephemeris: Ephemeris,
 }
 
 impl Position {
@@ -504,34 +588,31 @@ impl Position {
 
     /// Degrees into the current sign (0.0 ≤ x < 30.0).
     pub fn sign_degree(&self) -> f64 {
+        // The double modulo is deliberate: `rem_euclid(30.0)` alone can round
+        // to exactly 30.0 for tiny negative inputs, violating the documented
+        // half-open range. `rem_euclid(360.0)` first, then `% 30.0` on the
+        // now-nonnegative value, keeps the result in [0, 30).
         self.longitude.rem_euclid(360.0) % 30.0
     }
 }
 
 /// Compute a body's position at a Julian day (UT) with the default flags
-/// (Swiss Ephemeris files with Moshier fallback, speeds included).
+/// (Swiss Ephemeris files with Moshier fallback).
 pub fn calc(jd_ut: f64, body: Body) -> Result<Position> {
     calc_with(jd_ut, body, Flags::default())
 }
 
 /// Compute a body's position with explicit [`Flags`].
+///
+/// Speeds are always computed. Returns an error if both [`Flags::SWISS`] and
+/// [`Flags::MOSHIER`] are set.
 pub fn calc_with(jd_ut: f64, body: Body, flags: Flags) -> Result<Position> {
+    flags.validate_source()?;
     let mut xx = [0.0f64; 6];
-    let mut serr = [0 as c_char; sys::SE_MAX_STNAME];
-    let _guard = ffi_lock();
-    let ret = unsafe {
-        sys::swe_calc_ut(
-            jd_ut,
-            body.to_swe(),
-            flags.bits(),
-            xx.as_mut_ptr(),
-            serr.as_mut_ptr(),
-        )
-    };
-    drop(_guard);
-    if ret < 0 {
-        return Err(Error::new(read_serr(&serr)));
-    }
+    let iflag = flags.bits() | sys::SEFLG_SPEED;
+    let ret = locked_serr_call(|serr| unsafe {
+        sys::swe_calc_ut(jd_ut, body.to_swe(), iflag, xx.as_mut_ptr(), serr)
+    })?;
     Ok(Position {
         body,
         longitude: xx[0],
@@ -540,6 +621,9 @@ pub fn calc_with(jd_ut: f64, body: Body, flags: Flags) -> Result<Position> {
         speed_longitude: xx[3],
         speed_latitude: xx[4],
         speed_distance: xx[5],
+        // swe_calc_ut returns the flags it actually used, which differ from
+        // the request when the library falls back (e.g. missing .se1 files).
+        ephemeris: Ephemeris::from_iflag(ret),
     })
 }
 
@@ -628,11 +712,16 @@ pub struct Houses {
 /// circles; the C library then falls back to Porphyry cusps and reports an
 /// error, which is surfaced here as `Err`.
 pub fn houses(jd_ut: f64, latitude: f64, longitude: f64, system: HouseSystem) -> Result<Houses> {
-    houses_raw(jd_ut, None, latitude, longitude, system)
+    houses_with(jd_ut, latitude, longitude, system, Flags::NONE)
 }
 
-/// [`houses`] with explicit flags — pass [`Flags::SIDEREAL`] for sidereal
-/// cusps (after [`set_sidereal_mode`]).
+/// [`houses`] with explicit flags.
+///
+/// The C houses path honors only [`Flags::SIDEREAL`] (call
+/// [`set_sidereal_mode`] first) and [`Flags::NO_NUTATION`]; the ephemeris
+/// source bits affect only the internal delta-T model. All other flags —
+/// [`Flags::EQUATORIAL`], [`Flags::J2000`], etc. — are **silently ignored**
+/// by the C library: cusps are always ecliptic longitudes.
 pub fn houses_with(
     jd_ut: f64,
     latitude: f64,
@@ -640,39 +729,24 @@ pub fn houses_with(
     system: HouseSystem,
     flags: Flags,
 ) -> Result<Houses> {
-    houses_raw(jd_ut, Some(flags), latitude, longitude, system)
-}
-
-fn houses_raw(
-    jd_ut: f64,
-    flags: Option<Flags>,
-    latitude: f64,
-    longitude: f64,
-    system: HouseSystem,
-) -> Result<Houses> {
+    flags.validate_source()?;
     let mut cusps = [0.0f64; 13];
     let mut ascmc = [0.0f64; 10];
     let _guard = ffi_lock();
+    // swe_houses(x..) is equivalent to swe_houses_ex(x.., iflag=0) for this
+    // crate: the two differ only in delta-T tidal-acceleration selection when
+    // a non-DE431 JPL file has been loaded via swe_set_jplfile, which this
+    // crate never binds. Single code path, one C entry point.
     let ret = unsafe {
-        match flags {
-            None => sys::swe_houses(
-                jd_ut,
-                latitude,
-                longitude,
-                system.to_swe(),
-                cusps.as_mut_ptr(),
-                ascmc.as_mut_ptr(),
-            ),
-            Some(f) => sys::swe_houses_ex(
-                jd_ut,
-                f.bits(),
-                latitude,
-                longitude,
-                system.to_swe(),
-                cusps.as_mut_ptr(),
-                ascmc.as_mut_ptr(),
-            ),
-        }
+        sys::swe_houses_ex(
+            jd_ut,
+            flags.bits(),
+            latitude,
+            longitude,
+            system.to_swe(),
+            cusps.as_mut_ptr(),
+            ascmc.as_mut_ptr(),
+        )
     };
     drop(_guard);
     if ret < 0 {
@@ -718,26 +792,28 @@ impl Ayanamsha {
     }
 }
 
-/// Select the ayanamsha used by [`Flags::SIDEREAL`] computations and
-/// [`ayanamsha`]. Affects the whole process.
+/// Select the ayanamsha used by [`Flags::SIDEREAL`] computations.
+///
+/// **Call this before any sidereal computation** — if no mode has been set,
+/// the C library silently defaults to Fagan/Bradley. Process-wide state; see
+/// the crate docs on global configuration.
 pub fn set_sidereal_mode(mode: Ayanamsha) {
     let _guard = ffi_lock();
     unsafe { sys::swe_set_sid_mode(mode.to_swe(), 0.0, 0.0) };
 }
 
 /// The ayanamsha value (tropical minus sidereal longitude, in degrees) at a
-/// Julian day (UT), for the mode chosen with [`set_sidereal_mode`].
-pub fn ayanamsha(jd_ut: f64) -> Result<f64> {
+/// Julian day (UT) for the given mode.
+///
+/// Also selects `mode` as the process-wide sidereal mode (the two operations
+/// happen under one lock acquisition, so the value returned is always for
+/// the mode passed here).
+pub fn ayanamsha(jd_ut: f64, mode: Ayanamsha) -> Result<f64> {
     let mut daya = 0.0f64;
-    let mut serr = [0 as c_char; sys::SE_MAX_STNAME];
-    let _guard = ffi_lock();
-    let ret = unsafe {
-        sys::swe_get_ayanamsa_ex_ut(jd_ut, sys::SEFLG_SWIEPH, &mut daya, serr.as_mut_ptr())
-    };
-    drop(_guard);
-    if ret < 0 {
-        return Err(Error::new(read_serr(&serr)));
-    }
+    locked_serr_call(|serr| unsafe {
+        sys::swe_set_sid_mode(mode.to_swe(), 0.0, 0.0);
+        sys::swe_get_ayanamsa_ex_ut(jd_ut, sys::SEFLG_SWIEPH, &mut daya, serr)
+    })?;
     Ok(daya)
 }
 
@@ -786,48 +862,56 @@ pub struct Eclipse {
 }
 
 /// Find the next solar eclipse anywhere on Earth at or after `jd_start` (UT).
-/// Returns `Ok(None)` if the search finds no further eclipse.
-pub fn next_solar_eclipse(jd_start: f64) -> Result<Option<Eclipse>> {
-    eclipse_search(jd_start, true)
+///
+/// The search always finds one — solar eclipses recur at least twice a year —
+/// so there is no "none remaining" case; errors indicate an ephemeris
+/// failure.
+pub fn next_solar_eclipse(jd_start: f64) -> Result<Eclipse> {
+    eclipse_search(jd_start, true, Flags::default())
+}
+
+/// [`next_solar_eclipse`] with an explicit ephemeris source (e.g.
+/// [`Flags::MOSHIER`] for data-file-free operation). Only the source bits
+/// are used; all other flags are stripped.
+pub fn next_solar_eclipse_with(jd_start: f64, flags: Flags) -> Result<Eclipse> {
+    eclipse_search(jd_start, true, flags)
 }
 
 /// Find the next lunar eclipse at or after `jd_start` (UT).
-pub fn next_lunar_eclipse(jd_start: f64) -> Result<Option<Eclipse>> {
-    eclipse_search(jd_start, false)
+///
+/// The search always finds one; errors indicate an ephemeris failure.
+pub fn next_lunar_eclipse(jd_start: f64) -> Result<Eclipse> {
+    eclipse_search(jd_start, false, Flags::default())
 }
 
-fn eclipse_search(jd_start: f64, solar: bool) -> Result<Option<Eclipse>> {
+/// [`next_lunar_eclipse`] with an explicit ephemeris source.
+pub fn next_lunar_eclipse_with(jd_start: f64, flags: Flags) -> Result<Eclipse> {
+    eclipse_search(jd_start, false, flags)
+}
+
+fn eclipse_search(jd_start: f64, solar: bool, flags: Flags) -> Result<Eclipse> {
+    flags.validate_source()?;
     let mut tret = [0.0f64; 10];
-    let mut serr = [0 as c_char; sys::SE_MAX_STNAME];
-    // The eclipse search functions reject SEFLG_SPEED; pass the bare
-    // ephemeris flag.
-    let ifl = sys::SEFLG_SWIEPH;
-    let _guard = ffi_lock();
-    let ret = unsafe {
+    // The eclipse functions accept only the ephemeris-source bits and reject
+    // others (SEFLG_SPEED outright); strip everything else.
+    let ifl = flags.bits() & sys::SEFLG_EPHMASK;
+    let ret = locked_serr_call(|serr| unsafe {
         if solar {
-            sys::swe_sol_eclipse_when_glob(
-                jd_start,
-                ifl,
-                0,
-                tret.as_mut_ptr(),
-                0,
-                serr.as_mut_ptr(),
-            )
+            sys::swe_sol_eclipse_when_glob(jd_start, ifl, 0, tret.as_mut_ptr(), 0, serr)
         } else {
-            sys::swe_lun_eclipse_when(jd_start, ifl, 0, tret.as_mut_ptr(), 0, serr.as_mut_ptr())
+            sys::swe_lun_eclipse_when(jd_start, ifl, 0, tret.as_mut_ptr(), 0, serr)
         }
-    };
-    drop(_guard);
-    if ret < 0 {
-        return Err(Error::new(read_serr(&serr)));
-    }
+    })?;
+    // The C search loops until it finds an eclipse or fails with ERR; it
+    // never returns 0 (verified against swecl.c). Keep a defensive error
+    // rather than modeling an unreachable "none found" state.
     if ret == 0 {
-        return Ok(None);
+        return Err(Error::new("eclipse search returned no result (unexpected)"));
     }
-    Ok(Some(Eclipse {
+    Ok(Eclipse {
         maximum_jd: tret[0],
         kind: EclipseKind::from_retflag(ret),
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -868,6 +952,43 @@ mod tests {
     }
 
     #[test]
+    fn speeds_are_computed_even_without_speed_flag() {
+        // Regression: speed used to be silently 0.0 (retrograde() always
+        // false) when the caller built flags without SPEED.
+        let sun = calc_with(2451545.0, Body::Sun, Flags::SWISS).unwrap();
+        assert!(
+            sun.speed_longitude > 0.9 && sun.speed_longitude < 1.1,
+            "speed was {}",
+            sun.speed_longitude
+        );
+    }
+
+    #[test]
+    fn conflicting_ephemeris_sources_are_rejected() {
+        let err = calc_with(2451545.0, Body::Sun, Flags::SWISS | Flags::MOSHIER);
+        assert!(err.is_err(), "SWISS|MOSHIER must be rejected");
+    }
+
+    #[test]
+    fn ephemeris_downgrade_is_reported() {
+        // Explicit Moshier is always reported as Moshier.
+        let moshier = calc_with(2451545.0, Body::Sun, Flags::MOSHIER).unwrap();
+        assert_eq!(moshier.ephemeris, Ephemeris::Moshier);
+        // With SWISS requested, the field reports what was actually used:
+        // Moshier in this test environment (no .se1 files), Swiss if data
+        // files happen to be installed.
+        let requested_swiss = calc(2451545.0, Body::Sun).unwrap();
+        assert!(
+            matches!(
+                requested_swiss.ephemeris,
+                Ephemeris::Swiss | Ephemeris::Moshier
+            ),
+            "unexpected source: {:?}",
+            requested_swiss.ephemeris
+        );
+    }
+
+    #[test]
     fn all_planets_compute_without_data_files() {
         let jd = julian_day(1990, 6, 21, 12.0);
         for &body in Body::PLANETS {
@@ -878,6 +999,31 @@ mod tests {
                 pos.longitude
             );
         }
+    }
+
+    #[test]
+    fn sign_math_survives_rem_euclid_boundary_rounding() {
+        // rem_euclid(360.0) rounds to exactly 360.0 for tiny negative inputs;
+        // the sign index and degree math must stay in range regardless.
+        for lon in [-1e-18, -0.0, 0.0, 360.0, -360.0] {
+            let sign = Sign::from_longitude(lon); // must not panic
+            assert_eq!(sign, Sign::Aries, "lon {lon:e}");
+        }
+        let p = Position {
+            body: Body::Sun,
+            longitude: -1e-18,
+            latitude: 0.0,
+            distance: 1.0,
+            speed_longitude: 1.0,
+            speed_latitude: 0.0,
+            speed_distance: 0.0,
+            ephemeris: Ephemeris::Moshier,
+        };
+        assert!(
+            (0.0..30.0).contains(&p.sign_degree()),
+            "sign_degree out of range: {}",
+            p.sign_degree()
+        );
     }
 
     #[test]
@@ -914,18 +1060,23 @@ mod tests {
     #[test]
     fn total_solar_eclipse_of_april_2024() {
         let start = julian_day(2024, 3, 1, 0.0);
-        let e = next_solar_eclipse(start)
-            .unwrap()
-            .expect("eclipse expected");
+        let e = next_solar_eclipse(start).unwrap();
         assert_eq!(e.kind, EclipseKind::Total);
         let d = date_from_julian_day(e.maximum_jd);
         assert_eq!((d.year, d.month, d.day), (2024, 4, 8));
     }
 
     #[test]
+    fn eclipse_search_with_explicit_moshier() {
+        let start = julian_day(2024, 3, 1, 0.0);
+        let e = next_lunar_eclipse_with(start, Flags::MOSHIER).unwrap();
+        let d = date_from_julian_day(e.maximum_jd);
+        assert_eq!((d.year, d.month, d.day), (2024, 3, 25));
+    }
+
+    #[test]
     fn lahiri_ayanamsha_near_24_degrees_at_j2000() {
-        set_sidereal_mode(Ayanamsha::Lahiri);
-        let aya = ayanamsha(2451545.0).unwrap();
+        let aya = ayanamsha(2451545.0, Ayanamsha::Lahiri).unwrap();
         assert!((23.0..25.0).contains(&aya), "ayanamsha was {aya}");
     }
 

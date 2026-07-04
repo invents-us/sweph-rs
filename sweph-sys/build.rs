@@ -24,6 +24,5 @@ fn main() {
         // directly, you are responsible for that serialization.
         .define("TLSOFF", None)
         .warnings(false)
-        .opt_level(3)
         .compile("sweph");
 }

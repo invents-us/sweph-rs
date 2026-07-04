@@ -53,6 +53,10 @@ pub const SE_GREG_CAL: c_int = 1;
 pub const SEFLG_JPLEPH: c_int = 1;
 pub const SEFLG_SWIEPH: c_int = 2;
 pub const SEFLG_MOSEPH: c_int = 4;
+/// Mask of the ephemeris-source bits. `swe_calc_ut` returns the flags it
+/// actually used — compare against this mask to detect a silent fallback
+/// (e.g. Swiss requested, Moshier substituted because data files are absent).
+pub const SEFLG_EPHMASK: c_int = SEFLG_JPLEPH | SEFLG_SWIEPH | SEFLG_MOSEPH;
 pub const SEFLG_HELCTR: c_int = 8;
 pub const SEFLG_TRUEPOS: c_int = 16;
 pub const SEFLG_J2000: c_int = 32;

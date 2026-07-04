@@ -3,7 +3,7 @@
 Rust bindings for the [Swiss Ephemeris](https://www.astro.com/swisseph/), the
 high-precision astronomical library by Astrodienst used by most professional
 astrology software. Same JPL-derived data NASA uses; sub-arcsecond precision
-over roughly 10,800 BCE to 16,800 CE.
+over roughly 13,200 BCE to 17,191 CE (the JPL DE431 span).
 
 Two crates, following the standard Rust FFI split:
 
@@ -23,7 +23,7 @@ own naming (`sweph.c`, "the SWEPH package").
 
 ```toml
 [dependencies]
-sweph = "0.1"
+sweph = "0.2"
 ```
 
 ```rust
@@ -37,14 +37,15 @@ println!("Sun at {:.2}° {}", sun.sign_degree(), sun.sign()); // Sun at 29.86° 
 let houses = sweph::houses(jd, 40.7128, -74.0060, HouseSystem::Placidus)?;
 println!("Ascendant {:.2}°", houses.ascendant);
 
-let eclipse = sweph::next_solar_eclipse(jd)?.unwrap();
+let eclipse = sweph::next_solar_eclipse(jd)?;
 println!("next solar eclipse: {:?} at JD {}", eclipse.kind, eclipse.maximum_jd);
 ```
 
 Works out of the box with **no data files**: when the Swiss Ephemeris `*.se1`
 files are absent, the library transparently falls back to the built-in Moshier
 analytical ephemeris (~0.1″ precision for the planets — more than enough for
-astrology). For full precision, Chiron, or asteroids, download the
+astrology); `Position::ephemeris` tells you which source was actually used.
+For full precision, Chiron, or asteroids, download the
 [data files](https://github.com/aloistr/swisseph/tree/master/ephe) and call
 `sweph::set_ephe_path("/path/to/ephe")`.
 
