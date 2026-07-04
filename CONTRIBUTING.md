@@ -21,6 +21,14 @@ cargo test --workspace
 
 ## Ground rules
 
+### All changes land via pull request
+
+`main` is protected with `enforce_admins` — nobody pushes to it directly,
+maintainers included. Branch, open a PR, and merge when CI is green and
+conversations are resolved. (There is no required-review count: this is a
+solo-maintained project and GitHub does not let authors approve their own
+PRs; CI is the merge gate.)
+
 ### Vendored C sources are never hand-edited
 
 `sweph-sys/vendor/` must stay **byte-identical** to the upstream Swiss
