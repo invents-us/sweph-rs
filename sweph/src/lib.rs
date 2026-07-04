@@ -565,6 +565,11 @@ pub enum HouseSystem {
 }
 
 impl HouseSystem {
+    // SAFETY-RELEVANT: houses_raw passes a 13-slot cusp buffer, which is only
+    // large enough for 12-house systems. The Gauquelin system ('G') makes the
+    // C library write 37 cusps — adding it here without enlarging the buffer
+    // in houses_raw would be a stack buffer overflow. The same applies to the
+    // Sunshine systems ('I'/'i') only insofar as they must stay 12-house.
     fn to_swe(self) -> i32 {
         (match self {
             HouseSystem::Placidus => b'P',

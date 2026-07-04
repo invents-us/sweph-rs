@@ -201,14 +201,21 @@ extern "C" {
 mod tests {
     use super::*;
 
+    // The C library is not thread-safe and `cargo test` runs tests on
+    // multiple threads, so every test serializes on this lock — the same
+    // discipline the `sweph` crate applies for real callers.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn julday_j2000() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let jd = unsafe { swe_julday(2000, 1, 1, 12.0, SE_GREG_CAL) };
         assert!((jd - 2451545.0).abs() < 0.0001, "JD was {jd}");
     }
 
     #[test]
     fn calc_sun_position() {
+        let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
             let jd = swe_julday(2000, 1, 1, 12.0, SE_GREG_CAL);
             let mut xx = [0.0_f64; 6];
@@ -231,6 +238,7 @@ mod tests {
 
     #[test]
     fn version_string() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let mut buf = [0i8; SE_MAX_STNAME];
         let s = unsafe {
             swe_version(buf.as_mut_ptr().cast());

@@ -4,6 +4,7 @@ description = "Safe, thread-safe Rust API for the Swiss Ephemeris: planets, hous
 readme = "../README.md"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
