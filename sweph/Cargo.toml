@@ -1,0 +1,14 @@
+[package]
+name = "sweph"
+description = "Safe, thread-safe Rust API for the Swiss Ephemeris: planets, houses, eclipses, sidereal zodiac"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+sweph-sys = { path = "../sweph-sys", version = "0.1.0" }

@@ -1,0 +1,15 @@
+[package]
+name = "sweph-sys"
+description = "Raw FFI bindings to the Swiss Ephemeris C library (vendored sources, v2.10.03)"
+links = "sweph"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["science", "external-ffi-bindings"]
+
+[build-dependencies]
+cc = "1"

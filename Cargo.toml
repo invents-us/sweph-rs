@@ -1,0 +1,12 @@
+[workspace]
+members = ["sweph-sys", "sweph"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "AGPL-3.0-only"
+repository = "https://github.com/invents-us/sweph-rs"
+keywords = ["astrology", "ephemeris", "astronomy", "swisseph"]
+categories = ["science"]
