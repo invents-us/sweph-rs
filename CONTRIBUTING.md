@@ -65,8 +65,33 @@ changes belong in the Rust layer (or upstream at
 
 This project is licensed **AGPL-3.0-only** (see [README](README.md#license)
 for the upstream Swiss Ephemeris dual-licensing context). By submitting a
-contribution you agree that it is your own work and that you license it under
-the same terms (inbound = outbound).
+contribution you certify and agree that:
+
+1. **You have the right to submit it** — the contribution is your own
+   original work, or you otherwise have sufficient rights to submit it under
+   these terms.
+2. **Inbound = outbound** — your contribution is licensed to the project and
+   to everyone else under AGPL-3.0-only.
+3. **Additional grant to the maintainer** — you grant invents.us (the project
+   maintainer) a perpetual, worldwide, non-exclusive, royalty-free,
+   irrevocable license to use, reproduce, modify, distribute, and sublicense
+   your contribution under license terms of its choosing, including in
+   proprietary products.
+
+Point 3 exists for transparency's sake: the maintainer also uses these crates
+in its own commercial services, where the underlying C library is covered by
+the paid Swiss Ephemeris Professional License rather than the AGPL. Without
+the grant, external contributions would be AGPL-only and that use would have
+to stop. Everyone else receives every line of this project under the AGPL,
+exactly as before — the grant gives the maintainer no rights over *your*
+other code, only over what you contribute here.
+
+If you're not comfortable with the grant, please open an issue describing
+the change instead of a PR — maintainer-authored implementations of publicly
+suggested ideas carry no grant question.
+
+Maintainers: **do not merge external PRs from authors who have not agreed to
+these terms** (agreement is the checked box in the PR template).
 
 ## Conduct
 
