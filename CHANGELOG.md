@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-07-06
+
+- `calc_with` rejects `Flags::MOSHIER` for bodies the Moshier ephemeris
+  cannot compute (Chiron, Pholus, Ceres, Pallas, Juno, Vesta). The C library
+  reads the Swiss data file for these bodies regardless of the requested
+  source but still returns `SEFLG_MOSEPH`, so `Position::ephemeris` reported
+  `Moshier` for a position that actually came from the file (and Earth's
+  reduction really did use Moshier — a hybrid neither label describes).
+  Rejecting up front makes the outcome deterministic whether or not data
+  files are installed; previously the same call succeeded with a mislabeled
+  source when files were present and errored when they were absent.
+  **[breaking]** (fixes #4)
+
 ## 0.2.0 — 2026-07-04
 
 Fixes from a multi-agent review of the initial release, verified against the
