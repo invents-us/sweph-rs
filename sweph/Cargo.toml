@@ -12,4 +12,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sweph-sys = { path = "../sweph-sys", version = "0.2.0" }
+sweph-sys = { path = "../sweph-sys", version = "0.3.0" }

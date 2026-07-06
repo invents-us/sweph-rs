@@ -279,6 +279,11 @@ impl Flags {
     /// see [`Position::ephemeris`] to detect the substitution).
     pub const SWISS: Flags = Flags(sys::SEFLG_SWIEPH);
     /// Use the built-in Moshier analytical ephemeris (no data files).
+    ///
+    /// Moshier has no model for Chiron, Pholus, or the asteroids — those
+    /// always come from Swiss data files, so [`calc_with`] rejects this flag
+    /// for them rather than let the C library silently substitute the file
+    /// (while still labeling the result Moshier).
     pub const MOSHIER: Flags = Flags(sys::SEFLG_MOSEPH);
     /// Speeds are always requested by [`calc`] / [`calc_with`]; this constant
     /// is retained for interop with `sweph-sys`.
@@ -383,6 +388,8 @@ impl Ephemeris {
 ///
 /// Chiron, Pholus, and the asteroids require the corresponding data files;
 /// the planets, nodes, and apogees work with the Moshier fallback too.
+/// Requesting [`Flags::MOSHIER`] explicitly for a file-only body is rejected
+/// by [`calc_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Body {
     Sun,
@@ -425,6 +432,16 @@ impl Body {
         Body::Neptune,
         Body::Pluto,
     ];
+
+    // Bodies the Moshier analytical ephemeris has no model for — the C
+    // library computes them from Swiss data files regardless of the
+    // requested ephemeris source.
+    fn requires_data_files(self) -> bool {
+        matches!(
+            self,
+            Body::Chiron | Body::Pholus | Body::Ceres | Body::Pallas | Body::Juno | Body::Vesta
+        )
+    }
 
     fn to_swe(self) -> i32 {
         match self {
@@ -605,9 +622,18 @@ pub fn calc(jd_ut: f64, body: Body) -> Result<Position> {
 /// Compute a body's position with explicit [`Flags`].
 ///
 /// Speeds are always computed. Returns an error if both [`Flags::SWISS`] and
-/// [`Flags::MOSHIER`] are set.
+/// [`Flags::MOSHIER`] are set, or if [`Flags::MOSHIER`] is requested for a
+/// body Moshier cannot compute (Chiron, Pholus, Ceres, Pallas, Juno, Vesta —
+/// the C library would read the Swiss data file anyway while still labeling
+/// the result Moshier).
 pub fn calc_with(jd_ut: f64, body: Body, flags: Flags) -> Result<Position> {
     flags.validate_source()?;
+    if flags.contains(Flags::MOSHIER) && body.requires_data_files() {
+        return Err(Error::new(format!(
+            "the Moshier ephemeris has no model for {body}; it is computed \
+             from Swiss data files — use Flags::SWISS and set_ephe_path",
+        )));
+    }
     let mut xx = [0.0f64; 6];
     let iflag = flags.bits() | sys::SEFLG_SPEED;
     let ret = locked_serr_call(|serr| unsafe {
@@ -967,6 +993,34 @@ mod tests {
     fn conflicting_ephemeris_sources_are_rejected() {
         let err = calc_with(2451545.0, Body::Sun, Flags::SWISS | Flags::MOSHIER);
         assert!(err.is_err(), "SWISS|MOSHIER must be rejected");
+    }
+
+    #[test]
+    fn moshier_is_rejected_for_file_only_bodies() {
+        // Moshier has no asteroid model; the C library would silently read
+        // the Swiss data file and still return SEFLG_MOSEPH in the iflag,
+        // making Position::ephemeris lie (issue #4). Reject up front —
+        // deterministically, whether or not data files are installed.
+        let jd = julian_day(1990, 6, 21, 12.0);
+        for body in [
+            Body::Chiron,
+            Body::Pholus,
+            Body::Ceres,
+            Body::Pallas,
+            Body::Juno,
+            Body::Vesta,
+        ] {
+            let err = calc_with(jd, body, Flags::MOSHIER).unwrap_err();
+            assert!(
+                err.message().contains("Moshier"),
+                "{body}: unexpected message {:?}",
+                err.message()
+            );
+        }
+        // The nodes and apogees have Moshier models and must keep working.
+        for body in [Body::MeanNode, Body::TrueNode, Body::MeanApogee] {
+            calc_with(jd, body, Flags::MOSHIER).unwrap();
+        }
     }
 
     #[test]
