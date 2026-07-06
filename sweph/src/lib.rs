@@ -275,8 +275,10 @@ impl Flags {
     /// No flags. With no ephemeris-source bit set, the C library defaults to
     /// the Swiss Ephemeris.
     pub const NONE: Flags = Flags(0);
-    /// Use the Swiss Ephemeris data files (falls back to Moshier if absent —
-    /// see [`Position::ephemeris`] to detect the substitution).
+    /// Use the Swiss Ephemeris data files. When the files are absent, bodies
+    /// Moshier can compute fall back to Moshier (see [`Position::ephemeris`]
+    /// to detect the substitution); file-only bodies (Chiron, Pholus, the
+    /// asteroids) return an error instead.
     pub const SWISS: Flags = Flags(sys::SEFLG_SWIEPH);
     /// Use the built-in Moshier analytical ephemeris (no data files).
     ///
@@ -1018,7 +1020,12 @@ mod tests {
             );
         }
         // The nodes and apogees have Moshier models and must keep working.
-        for body in [Body::MeanNode, Body::TrueNode, Body::MeanApogee] {
+        for body in [
+            Body::MeanNode,
+            Body::TrueNode,
+            Body::MeanApogee,
+            Body::OsculatingApogee,
+        ] {
             calc_with(jd, body, Flags::MOSHIER).unwrap();
         }
     }
